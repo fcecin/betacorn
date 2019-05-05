@@ -11,11 +11,11 @@ Then "players" can guess the source 256-bit random numbers to be either odd or e
 
 Finally, "hosts" reveal the 256-bit random number source, and the "player" receives either an "Lose" transaction of 0.0001 ACORN or a "Win" transaction with their winnings.
 
-The contract has several checks and mitigations against spam and DoS attempts, but they might now be sufficient if the contract and/or ACORN gets too popular.
+The contract has several checks and mitigations against spam and DoS attempts, but they might not be sufficient if the contract and/or ACORN gets too popular.
 
 Players can play by merely sending ACORN into the contract. No need to interact with any other custom actions. The contract intercepts incoming transfers and sorts them out depending on the memo field.
 
-An incoming transfer with a memo of "odd" (or "0") or "even" (or "1") is interpreted as a player bet.
+An incoming transfer with a memo of "odd" (or "1") or "even" (or "0") is interpreted as a player bet.
 
 An incoming transfer with a memo of "deposit" is interpreted as a games host increasing their available bankroll.
 
