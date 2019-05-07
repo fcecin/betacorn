@@ -321,61 +321,64 @@ while (1) {
 
     # ---- cleos get account balance for our hostname ------------------------
 
-    print("Retrieving account balance of '$host_account' at '$contract'...\n"); 
-    
-    $cleos = `cleos get table $contract $contract accounts --index 2 --key-type i64 -L"$host_account" -U"$host_account"`;
+    print("Retrieving account balance of '$host_account' at '$contract'...\n");
+
+    $cleos = `cleos $url get table $contract $contract accounts --index 2 --key-type i64 -L"$host_account" -U"$host_account"`;
 
     if ($?) {
-	print("ERROR: cleos get table accounts failed. Skipping cycle.\n");
+	print("ERROR: cleos get table accounts failed. This is bad. The bot will think we have a balance of zero for the rest of the cycle.\n");
 	next;
     }
     
     my $balance;
     my $balance_number;
-    
-    my $json = decode_json( $cleos );
-    my $rows_item = $json->{'rows'};
-    if (defined $rows_item) {
 
-	my $rowcount = scalar @$rows_item;
-	if ($rowcount > 0) {
-	
-	    my $entry = $json->{'rows'}[0] or print ("ERROR: Parsing account balance (1).\n");
-	    if (defined $entry) {
-		my $owner = $entry->{'owner'} or print("ERROR: Parsing account balance (2).\n");  
-		if (defined $owner) {
-		    if ($owner eq $host_account ) {
-			$balance = $entry->{'balance'} or print ("ERROR: Parsing account balance (3).\n");
-			if (defined $balance) {
+    if (defined $cleos) {
+    
+	my $json = decode_json( $cleos );
+	my $rows_item = $json->{'rows'};
+	if (defined $rows_item) {
+	    
+	    my $rowcount = scalar @$rows_item;
+	    if ($rowcount > 0) {
+		
+		my $entry = $json->{'rows'}[0] or print ("ERROR: Parsing account balance (1).\n");
+		if (defined $entry) {
+		    my $owner = $entry->{'owner'} or print("ERROR: Parsing account balance (2).\n");  
+		    if (defined $owner) {
+			if ($owner eq $host_account ) {
+			    $balance = $entry->{'balance'} or print ("ERROR: Parsing account balance (3).\n");
+			    if (defined $balance) {
+				
+				# Convert to a number
+				$balance_number = substr $balance, 0, -6; # remove " ACORN"
+				if (! ($balance_number =~ /^-?[0-9]+\.[0-9]*$/)) {
+				    print ("ERROR: Parsing account balance (4).\n");
+				    undef $balance_number;
+				}
 			    
-			    # Convert to a number
-			    $balance_number = substr $balance, 0, -6; # remove " ACORN"
-			    if (! ($balance_number =~ /^-?[0-9]+\.[0-9]*$/)) {
-				print ("ERROR: Parsing account balance (4).\n");
-				undef $balance_number;
+			    } else {
+				print("ERROR: Parsing account balance (5).\n");
 			    }
-			    
-			} else {
-			    print("ERROR: Parsing account balance (5).\n");
 			}
 		    }
 		}
+	    } else {
+		# There are no rows in the returned JSON. All that means is that the host account
+		#   has no balance, i.e. its balance is zero. So emulate that behavior here.
+		
+		$balance = "0.0000 ACORN";
+		$balance_number = 0;
 	    }
 	} else {
-	    # There are no rows in the returned JSON. All that means is that the host account
-	    #   has no balance, i.e. its balance is zero. So emulate that behavior here.
-	    
-	    $balance = "0.0000 ACORN";
-	    $balance_number = 0;
+	    print("ERROR: Parsing account balance (0).\n");
 	}
-    } else {
-	print("ERROR: Parsing account balance (0).\n");
-    }
-
-    if (defined $balance) {
-	print("The bot has a balance of $balance.\n");
-    } else {
-	print("WARNING: Could not retrieve or parse the bot balance. This is sad.\n");
+	
+	if (defined $balance) {
+	    print("The bot has a balance of $balance.\n");
+	} else {
+	    print("WARNING: Could not retrieve or parse the bot balance. This is sad.\n");
+	}
     }
     
     # ---- cleos get matches table for our hostname ------------------------
@@ -385,65 +388,72 @@ while (1) {
     $cleos = `cleos $url get table $contract $contract matches --index 3 --key-type i64 --limit 1000000 -L"$host_account" -U"$host_account"`;
 
     if ($?) {
-	print("ERROR: cleos get table matches failed. Skipping cycle.\n");
+	print("ERROR: cleos get table matches failed. This is bad. The bot will think there are no games or matches for the rest of the cycle.\n");
 	next;
     }
 
-    $json = decode_json( $cleos );
+    # If we fail to get a list of games/matches and we want to quit, we will end
+    #   up quitting by thinking they are really gone.
+    # FIXME/TODO: We should probably retry for a few cycles before we give up on 
+    #   cleanup.
 
-    #print "CHECK FOR ERRORS:\n";
-    #print Dumper $json;
+    if (defined $cleos) {
 
-    my $rows = $json->{'rows'};
-    if (defined $rows) {
-        foreach(@{$rows}) {
-	    my $row = $_;
-	    my $host = $row->{'host'};
-	    if (defined $host) {
-		if ($host eq $host_account) {
-		    my $guess = $row->{'guess'};
-		    if (defined $guess) {
-			my $commitment = $row->{'commitment'};
-			if (defined $commitment) {
-			    
-			    if ($guess eq "127") {
-				push @games, $commitment;
-				#print ("GAME: $commitment\n");
+	my $json = decode_json( $cleos );
+	
+	#print "CHECK FOR ERRORS:\n";
+	#print Dumper $json;
+	
+	my $rows = $json->{'rows'};
+	if (defined $rows) {
+	    foreach(@{$rows}) {
+		my $row = $_;
+		my $host = $row->{'host'};
+		if (defined $host) {
+		    if ($host eq $host_account) {
+			my $guess = $row->{'guess'};
+			if (defined $guess) {
+			    my $commitment = $row->{'commitment'};
+			    if (defined $commitment) {
+				
+				if ($guess eq "127") {
+				    push @games, $commitment;
+				    #print ("GAME: $commitment\n");
+				} else {
+				    push @matches, $commitment;
+				    #print ("MATCH: $commitment\n");
+				}
 			    } else {
-				push @matches, $commitment;
-				#print ("MATCH: $commitment\n");
+				print("ERROR: Parsing matches (4).\n");
 			    }
 			} else {
-			    print("ERROR: Parsing matches (4).\n");
+			    print("ERROR: Parsing matches (3).\n");
 			}
 		    } else {
-			print("ERROR: Parsing matches (3).\n");
+			print("ERROR: Parsing matches (2).\n");
 		    }
 		} else {
-		    print("ERROR: Parsing matches (2).\n");
-		}
-	    } else {
-		print("ERROR: Parsing matches (1).\n");
-	    }				       
+		    print("ERROR: Parsing matches (1).\n");
+		}				       
+	    }
+	} else {
+	    print ("ERROR: Parsing matches (0).\n");
 	}
-    } else {
-	print ("ERROR: Parsing matches (0).\n")
     }
-	
+
     my $games_count = scalar @games;
     my $matches_count = scalar @matches;
 
-    print("Found $games_count game offers and $matches_count active games waiting for a reveal.\n");
-
+    if (defined $cleos) {
+	print("Found $games_count game offers and $matches_count active games waiting for a reveal.\n");
+    }
+	
     # ---- Evaluate quitting condition ---------------------
     
     if ($quitting) {
-
-	my $games_count = scalar @games;
-	my $matches_count = scalar @matches;
-
+	
 	if ($games_count == 0 && $matches_count == 0 && defined $balance && $balance eq "0.0000 ACORN") {
-	    print "We no longer have any game offers or ongoing games, and our balance is zero, and we want to quit, so we're quitting.\n";
+	    print "We (apparently) no longer have any game offers or ongoing games, and our balance is zero, and we want to quit, so we're quitting.\n";
 	    last;
 	}
 	
@@ -462,7 +472,7 @@ while (1) {
 
 	    print "We want to quit so we will attempt to withdraw the full $balance from $contract to $host_account first.\n";
 	    
-	    my $cleos = `cleos push action $contract withdraw '\{"to":"$host_account", "quantity":"$balance"\}' -p $host_account\@active`;
+	    my $cleos = `cleos $url push action $contract withdraw '\{"to":"$host_account", "quantity":"$balance"\}' -p $host_account\@active`;
 	    
 	    if ($?) {
 		print ("ERROR: cleos push action withdraw has failed. You will have to manually de-fund $host_account on $contract.\n"); 
@@ -534,7 +544,7 @@ while (1) {
 	    if (defined $match_source) {
 		
 		# Execute the reveal
-		$cleos = `cleos push action $contract reveal '\{"commitment":"$match_commitment", "source":"$match_source"\}' -p $host_account\@active`;
+		$cleos = `cleos $url push action $contract reveal '\{"commitment":"$match_commitment", "source":"$match_source"\}' -p $host_account\@active`;
 		
 		if ($?) {
 		    print ("ERROR: cleos push action reveal has failed for commit $match_commitment. This is bad!\n");
@@ -599,7 +609,7 @@ while (1) {
 	    
 	    # Push the commitment into the contract.
 	    
-	    $cleos = `cleos push action $contract commit '\{"host":"$host_account", "commitment":"$commitment"\}' -p $host_account\@active`;
+	    $cleos = `cleos $url push action $contract commit '\{"host":"$host_account", "commitment":"$commitment"\}' -p $host_account\@active`;
 	    
 	    if ($?) {
 		print ("ERROR: cleos push action commit has failed for new game #$i. Aborting commits for now...\n");
