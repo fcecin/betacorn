@@ -81,8 +81,7 @@ namespace eosio {
 
 	 // --------------------------------------------------------------------------------------
 	 // This is a global list of offered games.
-	 // When a player is matched to game, the game entry is deleted and a corresponding, new
-	 //   match entry is created to track the ongoing game (see below).
+	 // When a player is matched to game, the game entry is deleted.
 	 // This *could* merge with the 'match' table, but I think it's faster and safer to have
 	 //   a dedicated table that contains only open game offers (players find a vacant game
 	 //   room faster, only having to waddle through the house/account list first).
@@ -127,10 +126,15 @@ namespace eosio {
 
 	   // Players want to check all their games for timeouts at once. 
 	   uint64_t get_player() const { return player.value; }
+
+	   // Host bots may want to scan the matches table for their current commitments and
+	   //   their full status.
+	   uint64_t get_host() const { return host.value; }
 	 };
 
 	 typedef eosio::multi_index<"matches"_n, match, 
-				    indexed_by<"byplayer"_n, const_mem_fun<match, uint64_t, &match::get_player>>
+				    indexed_by<"byplayer"_n, const_mem_fun<match, uint64_t, &match::get_player>>,
+				    indexed_by<"byhost"_n, const_mem_fun<match, uint64_t, &match::get_host>>
 				    > matches;
 
 	 // --------------------------------------------------------------------------------------

@@ -17,11 +17,20 @@ void dice::withdraw( name to, asset quantity ) {
 }
 
 void dice::commit( name host, const checksum256& commitment ) {
+  require_auth( host );
 
   // Commitments are game proposals, and at first they are not matched to a player
   //   and to a bet size. When a player wants to play, they are matched with a
   //   commitment that belongs to a host that can cover the player bet with their
   //   current ACORN deposit balance.
+
+  // Check that the host has a positive deposit balance.
+  // Hosts can only propose commitments AFTER they have Shown Us The Money.
+  
+  accounts acnts( _self, _self.value );
+  auto owner_accounts = acnts.get_index<"byowner"_n>();
+  auto it = owner_accounts.find( host.value );
+  check( it != owner_accounts.end(), "cannot commit with a bankroll of zero" );
 
   // Check that the commitment's first 64 bits are unique among all commitments
   //   in the matches table.
@@ -57,7 +66,6 @@ void dice::commit( name host, const checksum256& commitment ) {
 }
 
 void dice::cancelcommit( name host, const checksum256& commitment ) {
-  
   require_auth( host );
 
   // find the match
