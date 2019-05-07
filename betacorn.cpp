@@ -101,7 +101,6 @@ void dice::reveal( const checksum256& commitment, const checksum256& source ) {
   const match & em = *mit;
 
   // Figure out who to pay for what.
-  asset host_payout = em.bet; // If this was a RAM placeholder without player, just undo it.
   if (em.guess != NULL_GUESS) {
     
     // build the payout value. we have to remove 0.0001 ACORN from it because we pay out
@@ -110,6 +109,7 @@ void dice::reveal( const checksum256& commitment, const checksum256& source ) {
 
     // check who won and issue the correct payout transaction to the player and calculate  
     //   the corresponding payout amount to the host.
+    asset host_payout;
     asset player_payout;
     string player_message;
     char result = source_array[31] & 1;
@@ -126,6 +126,9 @@ void dice::reveal( const checksum256& commitment, const checksum256& source ) {
     // notify and/or pay player
     pay( em.player, player_payout, player_message );
 
+    // update host balance
+    add_balance( em.host, host_payout, false );
+
   } else {
 
     // This is a reveal without a player, i.e. the "match" was just the placeholder match entry
@@ -136,9 +139,6 @@ void dice::reveal( const checksum256& commitment, const checksum256& source ) {
     auto git = gms.find( hash_prefix );
     gms.erase( git );
   }
-
-  // update host balance
-  add_balance( em.host, host_payout, false );
 
   // delete match entry
   mts.erase( mit );
