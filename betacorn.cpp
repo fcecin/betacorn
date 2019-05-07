@@ -48,14 +48,14 @@ void dice::commit( name host, const checksum256& commitment ) {
   
   // It is unique, so create an entry for it (host pays RAM, so no other checks or limitations needed)
   games gms( _self, _self.value );
-  gms.emplace( _self, [&]( auto& g ){
+  gms.emplace( host, [&]( auto& g ){
       g.commitment = commitment;
       g.host = host;
     });
 
   // We need to preallocate a mirror, dummy match entry because the player won't
   //   be able to pay for RAM.
-  mts.emplace( _self, [&]( auto& m ){
+  mts.emplace( host, [&]( auto& m ){
       m.commitment   = commitment;
       m.host         = host;
       m.guess        = NULL_GUESS;
@@ -290,7 +290,7 @@ void dice::add_balance( name owner, asset value, bool enforce_min ) {
       check( value >= MIN_BALANCE, "deposit does not meet minimum balance requirement" ); 
     }
     
-    acnts.emplace( _self, [&]( auto& a ){
+    acnts.emplace( owner, [&]( auto& a ){
 	a.owner   = owner;
 	a.balance = value;
       });
