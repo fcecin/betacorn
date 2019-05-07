@@ -1,0 +1,625 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Term::ReadKey;              # sudo apt-get install libterm-readkey
+use JSON qw( decode_json );     # sudo apt-get install libjson-perl
+use LWP::Simple;                # From CPAN
+
+use Data::Dumper;               # Perl core module
+
+#----------------------------------------------------------
+# A simple bot that feeds commitments and submits reveals
+#  to a http://github.com/fcecin/betacorn smart contract.
+#
+# This needs the 'cleos' command-line tool to be in your
+#  executable path.
+#
+# All files this bot manipulates are plain text files, e.g.
+#   the "endpoints" file is just one plain endpoint URL 
+#   per line.
+#----------------------------------------------------------
+
+#----------------------------------------------------------
+# Config
+#----------------------------------------------------------
+
+# In debug mode, no --url is passed to cleos. It will use the local nodeos instead.
+
+my $debug = 0;
+
+
+# Name of the account where the betacorn contract is deployed on the target 
+#   EOSIO blockchain.
+# "squirreldice" is the Telos account where the betacorn contract is deployed
+#   on Telos by the author of this bot. You may want to change this if you
+#   are interacting with another deployment of the contract and/or another 
+#   blockchain.
+
+my $contract = "squirreldice";
+
+
+# This is the name of the EOSIO account that has a balance deposited at 
+#   the betacorn contract at the target blockchain. The bot will use this
+#   account to commit and reveal games, withdraw, etc. 
+# Make sure you have the active key for this in the locally installed cleos.
+
+my $host_account = "******* PUT YOUR BOT'S EOSIO ACCOUNT NAME HERE *********";
+
+
+# Unlock password for the locally installed cleos
+
+my $cleos_wallet_password = "******* PUT YOUR CLEOS PASSWORD HERE *******";
+
+
+# This is an append-only / write-only log file that backs up EVERY SINGLE
+#   game commitment and key that have been generated for sending. If there
+#   is a pending commitment in the contract, you will find it somewhere in
+#   here.
+
+my $commit_log_file = "commit_log";
+
+
+# Endpoints file. This is read every loop cycle to see what endpoints the
+#   bot should be attempting to connect to. The bot chooses a random endpoint
+#   from the list for each cycle.
+# For example, you can create an "endpoints" text file in the same directory
+#   as the bot, and put a single line in it with the GoodBlock API URL:
+#
+# https://api.tlos.goodblock.io:443
+
+my $endpoints_file = "endpoints";
+
+
+# State file. This file persists the %commitments hash table.
+# When you start the bot, it will attempt to read the file and put it
+#   into the %commitments hash.
+# Whenever %commitments is changed, the file is regenerated with the 
+#   new content.
+
+my $state_file = 'state';
+
+
+# How many seconds to sleep before starting next bot poll / cycle.
+
+my $bot_cycle_sleep_secs = 20;
+
+
+# Number of commitments the bot will try to keep at any time.
+# We will serve up to 10 games per second.
+
+my $ideal_offer_count = $bot_cycle_sleep_secs * 10;
+
+
+# Minimum balance in ACORN. If balance below this, we stop
+#  serving games and when they are all gone, we quit.
+
+my $minimum_balance = 10.0;
+
+
+# Number of decay cycles before an entry is purged from %commitments
+
+my $cycles_before_purge = 100;
+
+
+#----------------------------------------------------------
+# State
+#----------------------------------------------------------
+
+# Quit flag. Set to true when <ESC> is pressed; the bot stats working
+#   towards exiting the forever loop.
+
+my $quitting = 0;
+
+
+# All API endpoints as an array of strings
+
+my @endpoints;
+
+
+# Hash of commits to sources. Each entry is what the bot thinks is an
+#   open game offer or an active match that we have revealed during
+#   the previous work cycle.
+# Both key and value are 64-char hex strings (i.e. an EOS checksum256).
+# The bot attempts to persist this file between sessions.
+
+my %commitments;
+
+
+# Array of commitments (keys to %games) for open (inactive) games (guess == "127").
+# This array is rebuilt every cycle.
+
+my @games;
+
+
+# Array of commitments (keys to %games) for active games (with a player guess
+#   of "0" or "1") awaiting reveal.
+# This array is rebuilt every cycle.
+
+my @matches;
+
+
+# Decay counter for entries (keys) in the %commitments hash table.
+# When we reveal a previous commitment, we don't delete its entry right away from %commitments.
+#   That's because we can't really know (or don't trust) if the blockchain really got the message
+#   and so we are not really sure here if we can just forget that commit-soruce pair.
+# Instead what we do here is keep an additional hash table of commitment-hash --> decay-counter.
+# Whenever we run a cycle where it seems the blockchain got rid of that commitment, we
+#   increment its decay counter by 1, as in "1 second" (the smallest cycle interval if the
+#   user is constantly pressing keys to accelerate it).
+# When the decay counter reaches $cycles_before_purge then we finally purge the commitment from 
+#   the persisted hash.
+# This is not persisted, so when the bot restarts all decay on the persistent entries is reset.
+
+my %decay;
+
+
+#----------------------------------------------------------
+# Sub for writing commitments state file.
+#----------------------------------------------------------
+
+sub WriteStateFile {
+    print ("Serializing current commitments into the state file...\n");
+    my $fh;
+    if (! (open $fh, '>', $state_file)) {
+	print ("ERROR: Cannot open commitments state file '$state_file' for overwriting.");
+    } else {
+	my $serdata = Dumper(\%commitments); 
+	print $fh $serdata;
+	close $fh;
+    }
+}
+
+#----------------------------------------------------------
+# Hi!
+#----------------------------------------------------------
+
+print "BetAcorn Bot starting.\n";
+print "Commit/reveal backups file (append-only) is '$commit_log_file'\n";
+print "API endpoints file (read-only) is '$endpoints_file'\n";
+if ($debug) {
+    print "Debug mode is ON.\n";
+}
+
+#----------------------------------------------------------
+# Load commitments state file.
+#----------------------------------------------------------
+
+print "Reading commitments state file...\n";
+
+my $fh;
+if (open $fh, '<', $state_file) {
+    print "Deserializing state data...\n";
+    
+    my $serdata = do { local $/; <$fh> };
+    close $fh;
+    
+    my $VAR1;
+    eval "$serdata";
+    %commitments = %$VAR1;
+
+    my $cnt = scalar keys %commitments;
+    print "Done deserializing data, found $cnt commitments.\n";
+
+} else {
+    print("INFO: No commitments state file '$state_file' found for reading. Bot is starting from scratch.\n");
+}
+
+#----------------------------------------------------------
+# The main loop consists of
+# - Sleep for 30 seconds
+# - Read some local files to see if some things changed
+# - Run cleos to see stuff
+# - Run cleos to ask for stuff
+# - If <ESC> is pressed at any point, the script thinks
+#   you want to quit, and it will eventually clean up
+#   their games/commitments and quit
+#----------------------------------------------------------
+
+my $key;
+my $print_quit_help;
+
+while (1) {
+
+    # ---- Keyboard handling & sleep  ----------------------------------
+
+    ReadMode 4;
+    
+    print "Bot sleeping for $bot_cycle_sleep_secs seconds. ";
+    
+    if ($quitting) {
+	print("Bot is already finishing up and quitting. Press any key to wake up the bot.\n");
+    } else {
+	print("Press <ENTER> to quit, or any other key to wake up the bot.\n");
+    }
+    
+    for (my $i = 0; $i < $bot_cycle_sleep_secs; $i++) {
+	
+    	sleep 1;
+	
+        my $slap_bot = 0;
+        do {
+	    $key = ReadKey(-1);
+	    if (defined $key) {
+		if (ord($key) == 10) {
+		    $quitting = 1;
+		}
+		$slap_bot = 1;
+	    }
+        } while (defined $key);
+	
+        if ($slap_bot || $quitting) {
+	    last;
+        }
+    }
+
+    ReadMode 0;
+    
+    # ---- Waking up! ------------------------------------------------
+
+    print "---------------------------------------------------------------------------\n";
+    print "Bot running...\n";
+
+    my $commitments_count = scalar keys %commitments;
+    
+    print "We have $commitments_count entries in our commitments hash table.\n";
+
+    @games = ();
+    @matches = ();
+    
+    # ---- Reload API endpoints file ----------------------------------
+
+    my $handle;
+    if (open $handle, '<', $endpoints_file) {
+	chomp(my @reload = <$handle>);
+	close $handle;
+	# Push non-blank lines into a new endpoints array
+	@endpoints = ();
+	foreach(@reload) { if( ( defined $_) and !($_ =~ /^$/ )){ push(@endpoints, $_); } }
+	my $sz = scalar @endpoints;
+	print("Loaded $sz EOSIO API endpoints from '$endpoints_file' file.\n");
+	if ($sz == 0) {
+	    print("ERROR: No known EOSIO API endpoints to connect to. Please add them to the endpoints file.\n");
+            next;	      
+        }
+    } else {
+	print("ERROR: Cannot open endpoints file '$endpoints_file' for reading. No endpoints known. Can't do anything.\n");
+	next;
+    }
+
+    # ---- Choose random API endpoint for this cycle ------------------
+
+    my $chosen_node = @endpoints[ int(rand(scalar @endpoints)) ]; 
+
+    print("API endpoint for this cycle is: $chosen_node\n");
+
+    my $url = "";
+    if ($debug) {
+	print("... but we are in DEBUG MODE so we're using the default nodeos location instead.\n"); 
+    } else {
+	$url = "--url \"$chosen_node\"";
+    }
+    
+    # ---- cleos wallet unlock ----------------------------------------
+
+    my $cleos;
+
+    $cleos = `cleos wallet lock`;
+    if ($?) {
+	print ("ERROR: Cannot call cleos. Make sure it is installed in the path (the EOSIO binary distribution should have done that).\n");
+	next;
+    }
+    print("cleos wallet lock returned: $cleos");
+
+    $cleos = `cleos wallet unlock --password $cleos_wallet_password`;
+    if ($?) {
+	print("ERROR: Failed to execute cleos wallet unlock. Make sure the wallet password is correct.\n");
+	next;
+    }
+    print("cleos wallet unlock returned: $cleos");
+
+    # ---- cleos get account balance for our hostname ------------------------
+
+    print("Retrieving account balance of '$host_account' at '$contract'...\n"); 
+    
+    $cleos = `cleos get table $contract $contract accounts --index 2 --key-type i64 -L"$host_account" -U"$host_account"`;
+
+    if ($?) {
+	print("ERROR: cleos get table accounts failed. Skipping cycle.\n");
+	next;
+    }
+    
+    my $balance;
+    my $balance_number;
+    
+    my $json = decode_json( $cleos );
+    my $rows_item = $json->{'rows'};
+    if (defined $rows_item) {
+
+	my $rowcount = scalar @$rows_item;
+	if ($rowcount > 0) {
+	
+	    my $entry = $json->{'rows'}[0] or print ("ERROR: Parsing account balance (1).\n");
+	    if (defined $entry) {
+		my $owner = $entry->{'owner'} or print("ERROR: Parsing account balance (2).\n");  
+		if (defined $owner) {
+		    if ($owner eq $host_account ) {
+			$balance = $entry->{'balance'} or print ("ERROR: Parsing account balance (3).\n");
+			if (defined $balance) {
+			    
+			    # Convert to a number
+			    $balance_number = substr $balance, 0, -6; # remove " ACORN"
+			    if (! ($balance_number =~ /^-?[0-9]+\.[0-9]*$/)) {
+				print ("ERROR: Parsing account balance (4).\n");
+				undef $balance_number;
+			    }
+			    
+			} else {
+			    print("ERROR: Parsing account balance (5).\n");
+			}
+		    }
+		}
+	    }
+	} else {
+	    # There are no rows in the returned JSON. All that means is that the host account
+	    #   has no balance, i.e. its balance is zero. So emulate that behavior here.
+	    
+	    $balance = "0.0000 ACORN";
+	    $balance_number = 0;
+	}
+    } else {
+	print("ERROR: Parsing account balance (0).\n");
+    }
+
+    if (defined $balance) {
+	print("The bot has a balance of $balance.\n");
+    } else {
+	print("WARNING: Could not retrieve or parse the bot balance. This is sad.\n");
+    }
+    
+    # ---- cleos get matches table for our hostname ------------------------
+
+    print("Retrieving full list of games hosted by '$host_account' at '$contract'...\n"); 
+    
+    $cleos = `cleos $url get table $contract $contract matches --index 3 --key-type i64 --limit 1000000 -L"$host_account" -U"$host_account"`;
+
+    if ($?) {
+	print("ERROR: cleos get table matches failed. Skipping cycle.\n");
+	next;
+    }
+
+    $json = decode_json( $cleos );
+
+    #print "CHECK FOR ERRORS:\n";
+    #print Dumper $json;
+
+    my $rows = $json->{'rows'};
+    if (defined $rows) {
+        foreach(@{$rows}) {
+	    my $row = $_;
+	    my $host = $row->{'host'};
+	    if (defined $host) {
+		if ($host eq $host_account) {
+		    my $guess = $row->{'guess'};
+		    if (defined $guess) {
+			my $commitment = $row->{'commitment'};
+			if (defined $commitment) {
+			    
+			    if ($guess eq "127") {
+				push @games, $commitment;
+				#print ("GAME: $commitment\n");
+			    } else {
+				push @matches, $commitment;
+				#print ("MATCH: $commitment\n");
+			    }
+			} else {
+			    print("ERROR: Parsing matches (4).\n");
+			}
+		    } else {
+			print("ERROR: Parsing matches (3).\n");
+		    }
+		} else {
+		    print("ERROR: Parsing matches (2).\n");
+		}
+	    } else {
+		print("ERROR: Parsing matches (1).\n");
+	    }				       
+	}
+    } else {
+	print ("ERROR: Parsing matches (0).\n")
+    }
+	
+    my $games_count = scalar @games;
+    my $matches_count = scalar @matches;
+
+    print("Found $games_count game offers and $matches_count active games waiting for a reveal.\n");
+
+    # ---- Evaluate quitting condition ---------------------
+    
+    if ($quitting) {
+
+	my $games_count = scalar @games;
+	my $matches_count = scalar @matches;
+
+	if ($games_count == 0 && $matches_count == 0 && defined $balance && $balance eq "0.0000 ACORN") {
+	    print "We no longer have any game offers or ongoing games, and our balance is zero, and we want to quit, so we're quitting.\n";
+	    last;
+	}
+	
+	if ($balance_number > 0) {
+
+	    # Before the bot quits, the host has to withdraw all of their ACORN from the betacorn contract. By doing so
+	    #   we will make sure that no new games can be created, and any existing unmatched game offers will be
+	    #   erased by the betacorn contract itself (so we don't have to do it here, yay).
+	    # We only quit when a query for games/matches returns absolutely nothing from the server and our balance is zero.
+	    # We could still have some games/matches "resurrected" due to chain reorg etc. (that why we have %decay) but
+	    #   if that kind of thing happens while we're quitting, then sincerely the answer is MEH (free timeout wins for 
+	    #   the players who manage this).
+	    # And in any case if you run a serious shop, you'd be monitoring the chain for the next five minutes or so
+	    #   after shutting down the bot, OR you would modify the bot to only really quit after a full five minutes
+	    #   after they are seeing nothing from the chain.
+
+	    print "We want to quit so we will attempt to withdraw the full $balance from $contract to $host_account first.\n";
+	    
+	    my $cleos = `cleos push action $contract withdraw '\{"to":"$host_account", "quantity":"$balance"\}' -p $host_account\@active`;
+	    
+	    if ($?) {
+		print ("ERROR: cleos push action withdraw has failed. You will have to manually de-fund $host_account on $contract.\n"); 
+	    } else {
+		print "...it seems we have successfully executed the withdrawal. Bot balance should be zero in the next cycle.\n";
+	    }
+	}
+    }
+    
+    # ---- Update commitment entry decay and purge as needed ----------
+
+    my %matchesmap = map { $_ => 1 } @matches;
+    my %gamesmap = map { $_ => 1 } @games;
+
+    my @ckeys = keys %commitments;
+
+    my $commitment_purge_count = 0;
+    my $commitment_rotting_count = 0;
+    
+    foreach(@ckeys) {
+	# is it absent from both matches and games?
+	my $ckey = $_;
+	if ( (! exists($matchesmap{$ckey})) && (! exists($gamesmap{$ckey})) ) {
+	    # no. increment decay
+	    if (exists($decay{$ckey})) {
+		my $currdecay = $decay{$ckey};
+		$currdecay ++;
+		if ($currdecay > $cycles_before_purge) {
+
+		    # erase decay entry
+		    delete($decay{$ckey});
+
+		    # erase commitment entry
+		    delete($commitments{$ckey});
+
+		    $commitment_purge_count ++;
+		    		    
+		} else {
+		    $decay{$ckey} = $currdecay;
+		    $commitment_rotting_count ++;
+		}
+	    } else {
+		$decay{$ckey} = 1;
+		$commitment_rotting_count ++;
+	    }
+	}
+    }
+
+    if ($commitment_purge_count > 0) {
+	print("Purged $commitment_purge_count entries from the commitments hash table (old commits we have revealed $cycles_before_purge cycles ago).\n");
+
+	WriteStateFile();
+    }
+
+    if ($commitment_rotting_count > 0) {
+	print("There are $commitment_rotting_count entries in the commitments hash table that are currently rotting (old commits).\n");
+    }
+    
+    # ---- If found any ongoing games with a player guess, execute a reveal for each before they time out! ----------
+
+    if ($matches_count > 0) {
+
+	print("We will now execute cleos to submit $matches_count reveals...\n");
+	
+	foreach (@matches) {
+	    my $match_commitment = $_;
+	    
+	    my $match_source = $commitments{$match_commitment} or print("ERROR: Cannot find commitment $match_commitment in the commitments hash table! This is a bug.\n");
+	    if (defined $match_source) {
+		
+		# Execute the reveal
+		$cleos = `cleos push action $contract reveal '\{"commitment":"$match_commitment", "source":"$match_source"\}' -p $host_account\@active`;
+		
+		if ($?) {
+		    print ("ERROR: cleos push action reveal has failed for commit $match_commitment. This is bad!\n");
+		    last;
+		}
+	    }
+	}
+	
+	print("Done trying to submit commitment sources for all ongoing games.\n"); 
+    } else {
+	print("Nothing to reveal for now.\n");
+    }
+    
+    # ---- Generate more commitments and push them into the contract ------------------------
+    
+    if (! defined $balance_number) {
+	print "ERROR: We don't know how much ACORN we have, so we cannot consider producing any new games.\n";
+    } elsif ($balance_number < $minimum_balance) {
+	print "WARNING: Our ACORN balance of $balance_number is below the minimum of $minimum_balance, so we won't consider producing new games.\n"; 
+    } elsif ($games_count < $ideal_offer_count) {
+	
+	my $generate_count = $ideal_offer_count - $games_count;
+	
+	print ("Will generate and publish commitments for an additional $generate_count game offers...\n");
+	
+	for (my $i = 0; $i < $generate_count; $i++) {
+	    
+	    my $source = `openssl rand -hex 32`;
+	    
+	    if ($?) {
+		print ("ERROR: Cannot call openssl to generate random hex number. Make sure openssl is in the executable path.\n");
+		last;
+	    }
+	    
+	    chomp ( $source );
+	    
+	    my $commitment = `echo -n '$source' | xxd -r -p | sha256sum -b | awk '\{print \$1\}'`;
+	    
+	    if ($?) {
+		print ("ERROR: Cannot call xxd, sha256sum or awk. Make sure these are on the executable path.\n");
+		last;
+	    }
+	    
+	    chomp ( $commitment );
+	    
+	    #print("   $source ----> $commitment\n");
+	    
+	    # File away every single source & commitment pair we generate in our global hash table
+	    # This could only ever be automatically forgotten with extreme care.
+	    
+	    $commitments{$commitment} = $source;
+
+	    # Also write the commitment in the write-only commitments log file, as a backup.
+
+	    my $fd;
+	    if (! open($fd, ">>$commit_log_file")) {
+		print "ERROR: Cannot open commit log file '$commit_log_file' for writing.\n";
+	    } else {
+		print $fd "commit: $commitment\n";
+		print $fd "source: $source\n";
+	    }
+	    
+	    # Push the commitment into the contract.
+	    
+	    $cleos = `cleos push action $contract commit '\{"host":"$host_account", "commitment":"$commitment"\}' -p $host_account\@active`;
+	    
+	    if ($?) {
+		print ("ERROR: cleos push action commit has failed for new game #$i. Aborting commits for now...\n");
+		last;
+	    }
+	}
+
+	WriteStateFile();
+	
+	print "... done pushing our new games.\n";
+    } else {
+	print "Nothing to commit for now.\n";
+    }
+}
+
+#----------------------------------------------------------
+# Bye!
+#----------------------------------------------------------
+
+ReadMode 0;
+
+print "BetAcornBot is exiting normally.\n";
+
