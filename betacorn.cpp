@@ -289,8 +289,14 @@ void dice::add_balance( name owner, asset value, bool enforce_min ) {
       // This helps because players iterate over all accounts to find a suitable game host.
       check( value >= MIN_BALANCE, "deposit does not meet minimum balance requirement" ); 
     }
-    
-    acnts.emplace( owner, [&]( auto& a ){
+
+    // The RAM payer needs to be the contract itself. We can't charge RAM during
+    //   an incoming ACORN transfer.
+    // (Not sure how this was working at all before, with "owner" being charged
+    //   for the RAM.)
+    // The only other way to do this is create an "open account" action that charges
+    //   RAM to the caller. For now let's just do this.
+    acnts.emplace( _self, [&]( auto& a ){
 	a.owner   = owner;
 	a.balance = value;
       });
